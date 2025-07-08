@@ -42,6 +42,22 @@ impl ConfigShiftMode {
     }
 }
 
+#[derive(Serialize, Deserialize, Default, Clone, Copy, PartialEq)]
+enum ConfigCoverMode {
+    #[default]
+    Off,
+    Simple,
+    BurnInPrevention,
+}
+impl ConfigCoverMode {
+    fn should_show_cover(self) -> bool {
+        match self {
+            ConfigCoverMode::Off => false,
+            ConfigCoverMode::Simple | ConfigCoverMode::BurnInPrevention => true,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Default, Clone)]
 struct ConfigFont {
     path: PathBuf,
@@ -54,7 +70,7 @@ struct Config {
     font: Option<ConfigFont>,
     show_time: bool,
     show_media: bool,
-    show_cover: bool,
+    cover_mode: ConfigCoverMode,
     idle_timeout: bool,
     oled_shift: ConfigShiftMode,
     show_notifications: bool,
@@ -67,7 +83,7 @@ impl Default for Config {
             font: None,
             show_time: true,
             show_media: true,
-            show_cover: true,
+            cover_mode: ConfigCoverMode::default(),
             idle_timeout: true,
             oled_shift: ConfigShiftMode::default(),
             show_notifications: true,
@@ -175,7 +191,14 @@ fn main() {
     // Create tray icon with menu
     let tm_time_check = CheckMenuItem::new("Show time", true, config.show_time, None);
     let tm_media_check = CheckMenuItem::new("Show playing media", true, config.show_media, None);
-    let tm_cover_check = CheckMenuItem::new("Show album covers", true, config.show_cover, None);
+    let tm_cover_off = CheckMenuItem::new("Off", true, config.cover_mode == ConfigCoverMode::Off, None);
+    let tm_cover_simple = CheckMenuItem::new("Simple", true, config.cover_mode == ConfigCoverMode::Simple, None);
+    let tm_cover_burnin = CheckMenuItem::new(
+        "Burn In Prevention",
+        true,
+        config.cover_mode == ConfigCoverMode::BurnInPrevention,
+        None,
+    );
     let tm_notif_check = CheckMenuItem::new("Show connection notifications", true, config.show_notifications, None);
     let tm_ignore_browser_check = CheckMenuItem::new("Ignore browser media", true, config.ignore_browser_media, None);
     let tm_idle_check = CheckMenuItem::new("Screensaver when idle", true, config.idle_timeout, None);
@@ -187,7 +210,11 @@ fn main() {
         &PredefinedMenuItem::separator(),
         &tm_time_check,
         &tm_media_check,
-        &tm_cover_check,
+        &dialog_unwrap(Submenu::with_items(
+            "Album covers",
+            true,
+            &[&tm_cover_off, &tm_cover_simple, &tm_cover_burnin],
+        )),
         &tm_notif_check,
         &tm_ignore_browser_check,
         &tm_idle_check,
@@ -236,8 +263,23 @@ fn main() {
                 id if id == tm_media_check.id() => {
                     config.show_media = tm_media_check.is_checked();
                 }
-                id if id == tm_cover_check.id() => {
-                    config.show_cover = tm_cover_check.is_checked();
+                id if id == tm_cover_off.id() => {
+                    config.cover_mode = ConfigCoverMode::Off;
+                    tm_cover_off.set_checked(true);
+                    tm_cover_simple.set_checked(false);
+                    tm_cover_burnin.set_checked(false);
+                }
+                id if id == tm_cover_simple.id() => {
+                    config.cover_mode = ConfigCoverMode::Simple;
+                    tm_cover_off.set_checked(false);
+                    tm_cover_simple.set_checked(true);
+                    tm_cover_burnin.set_checked(false);
+                }
+                id if id == tm_cover_burnin.id() => {
+                    config.cover_mode = ConfigCoverMode::BurnInPrevention;
+                    tm_cover_off.set_checked(false);
+                    tm_cover_simple.set_checked(false);
+                    tm_cover_burnin.set_checked(true);
                 }
                 id if id == tm_notif_check.id() => {
                     config.show_notifications = tm_notif_check.is_checked();
@@ -308,13 +350,17 @@ fn oled_worker(rx: Receiver<WorkerMsg>, mut config: Config) {
     )));
     let mut last_time = Local::now() - TimeDelta::seconds(1);
     let mut last_media_info = String::new();
-    let mut last_config_state = format!("{}{}{}", config.show_time, config.show_media, config.show_cover);
+    let mut last_config_state = format!("{}{}{}", config.show_time, config.show_media, config.cover_mode as u8);
     let mut time_layers: Vec<LayerId> = vec![];
     let mut media_layers: Vec<LayerId> = vec![];
     let mut cover_layer: Option<LayerId> = None;
     let mut notif_layer: Option<LayerId> = None;
     let mut notif_expiry = Local::now();
     let mut temp_no_cover_mode = false;
+
+    // Cover display management for burn-in prevention
+    let mut show_cover_until = Local::now();
+    let cover_display_duration = TimeDelta::seconds(5);
 
     // State for event validation
     let mut recent_events: Vec<(u8, [u8; 8])> = Vec::new();
@@ -370,7 +416,7 @@ fn oled_worker(rx: Receiver<WorkerMsg>, mut config: Config) {
                                 None
                             };
 
-                            let would_show_cover = config.show_cover
+                            let would_show_cover = config.cover_mode.should_show_cover()
                                 && config.show_media
                                 && media
                                     .as_ref()
@@ -469,10 +515,36 @@ fn oled_worker(rx: Receiver<WorkerMsg>, mut config: Config) {
                 let current_media_info = media
                     .as_ref()
                     .map_or(String::new(), |m| format!("{}_{}", m.title, m.artist));
-                let current_config_state = format!("{}{}{}", config.show_time, config.show_media, config.show_cover);
+                let current_config_state =
+                    format!("{}{}{}", config.show_time, config.show_media, config.cover_mode as u8);
                 let media_changed = current_media_info != last_media_info;
                 let config_changed = current_config_state != last_config_state;
-                let need_update = media_changed || config_changed;
+
+                // If media changed and we're in burn-in prevention mode, show cover for 5 seconds
+                if media_changed
+                    && config.cover_mode == ConfigCoverMode::BurnInPrevention
+                    && config.show_media
+                    && media.is_some()
+                {
+                    show_cover_until = time + cover_display_duration;
+                }
+
+                // Determine if we should show cover right now
+                let should_show_cover_now = config.cover_mode.should_show_cover()
+                    && config.show_media
+                    && media
+                        .as_ref()
+                        .and_then(|m| m.cover.as_ref())
+                        .is_some_and(|cover| !is_cover_useless(cover))
+                    && !temp_no_cover_mode
+                    && (config.cover_mode == ConfigCoverMode::Simple || time <= show_cover_until);
+
+                // Check if cover display state changed (for burn-in prevention timeout)
+                let cover_state_changed = config.cover_mode == ConfigCoverMode::BurnInPrevention
+                    && time > show_cover_until
+                    && cover_layer.is_some();
+
+                let need_update = media_changed || config_changed || cover_state_changed;
 
                 if need_update {
                     dev.pause();
@@ -485,15 +557,7 @@ fn oled_worker(rx: Receiver<WorkerMsg>, mut config: Config) {
                         cover_layer = None;
                     }
 
-                    let display_cover = config.show_cover
-                        && config.show_media
-                        && media
-                            .as_ref()
-                            .and_then(|m| m.cover.as_ref())
-                            .is_some_and(|cover| !is_cover_useless(cover))
-                        && !temp_no_cover_mode;
-
-                    if display_cover {
+                    if should_show_cover_now {
                         // Layout with cover: compact time and media on left, cover on right
                         if let Some(m) = &media {
                             if let Some(cover_bitmap) = &m.cover {
@@ -580,22 +644,13 @@ fn oled_worker(rx: Receiver<WorkerMsg>, mut config: Config) {
                     dev.pause();
                     dev.remove_layers(&time_layers);
 
-                    let display_cover = config.show_cover
-                        && config.show_media
-                        && media.is_some()
-                        && media
-                            .as_ref()
-                            .and_then(|m| m.cover.as_ref())
-                            .is_some_and(|cover| !is_cover_useless(cover))
-                        && !temp_no_cover_mode;
-
-                    if display_cover || (media.is_some() && config.show_media) {
+                    if should_show_cover_now || (media.is_some() && config.show_media) {
                         // Compact time layout
                         let time_str = time.format("%H:%M:%S").to_string();
                         time_layers = dev.add_text(
                             &time_str,
-                            if display_cover { Some(0) } else { None },
-                            Some(if display_cover { 8 } else { 2 }),
+                            if should_show_cover_now { Some(0) } else { None },
+                            Some(if should_show_cover_now { 8 } else { 2 }),
                         );
                     } else {
                         // Large fullscreen time
