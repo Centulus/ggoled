@@ -25,6 +25,7 @@ pub enum DeviceEvent {
     Volume { volume: u8 },
     Battery { headset: u8, charging: u8 },
     HeadsetConnection { connected: bool },
+    Raw([u8; 64]),
 }
 
 pub struct Device {
@@ -260,24 +261,13 @@ impl Device {
         Ok(())
     }
 
-    fn parse_event(buf: &[u8; 64]) -> Option<DeviceEvent> {
+    fn parse_event(&self, buf: &[u8; 64]) -> Option<DeviceEvent> {
         #[cfg(debug_assertions)]
         println!("parse_event: {:x?}", buf);
         if buf[0] != 7 {
             return None;
         }
-        Some(match buf[1] {
-            0x25 => DeviceEvent::Volume {
-                volume: 0x38u8.saturating_sub(buf[2]),
-            },
-            0xb5 => DeviceEvent::HeadsetConnection { connected: buf[4] == 8 },
-            0xb7 => DeviceEvent::Battery {
-                headset: buf[2],
-                charging: buf[3],
-                // NOTE: there's a chance `buf[4]` represents the max value, but i don't have any other devices to test with
-            },
-            _ => return None,
-        })
+        Some(DeviceEvent::Raw(*buf))
     }
 
     /// Poll events from the device. This blocks until an event is returned.
@@ -285,7 +275,7 @@ impl Device {
         let mut buf = [0u8; 64];
         self.info_dev.set_blocking_mode(true)?;
         _ = self.info_dev.read(&mut buf)?;
-        Ok(Self::parse_event(&buf))
+        Ok(self.parse_event(&buf))
     }
 
     /// Return any pending events from the device. Non-blocking.
@@ -297,7 +287,7 @@ impl Device {
             let len = self.info_dev.read(&mut buf)?;
             if len == 0 {
                 break;
-            } else if let Some(event) = Self::parse_event(&buf) {
+            } else if let Some(event) = self.parse_event(&buf) {
                 events.push(event);
             }
         }
