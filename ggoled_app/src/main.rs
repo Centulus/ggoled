@@ -314,6 +314,7 @@ fn oled_worker(rx: Receiver<WorkerMsg>, mut config: Config) {
     let mut cover_layer: Option<LayerId> = None;
     let mut notif_layer: Option<LayerId> = None;
     let mut notif_expiry = Local::now();
+    let mut temp_no_cover_mode = false;
 
     // State for event validation
     let mut recent_events: Vec<(u8, [u8; 8])> = Vec::new();
@@ -362,39 +363,63 @@ fn oled_worker(rx: Receiver<WorkerMsg>, mut config: Config) {
                     ggoled_draw::DrawEvent::DeviceDisconnected => {}
                     ggoled_draw::DrawEvent::DeviceReconnected => {}
                     ggoled_draw::DrawEvent::DeviceEvent(ggoled_lib::DeviceEvent::HeadsetConnection { connected }) => {
-                        // Only show notification if not in cover + media mode and notifications are enabled
                         if config.show_notifications {
                             let media = if config.show_media {
                                 mgr.get_media(config.ignore_browser_media)
                             } else {
                                 None
                             };
-                            let should_show_cover = config.show_cover && config.show_media && media.is_some();
-                            let has_usable_cover = if let Some(m) = &media {
-                                m.cover.as_ref().is_some_and(|cover| !is_cover_useless(cover))
-                            } else {
-                                false
-                            };
-                            let display_cover = should_show_cover && has_usable_cover;
 
-                            if !display_cover {
-                                if let Some(id) = notif_layer {
+                            let would_show_cover = config.show_cover
+                                && config.show_media
+                                && media
+                                    .as_ref()
+                                    .and_then(|m| m.cover.as_ref())
+                                    .is_some_and(|cover| !is_cover_useless(cover));
+
+                            if would_show_cover {
+                                temp_no_cover_mode = true;
+                                dev.pause();
+                                dev.remove_layers(&time_layers);
+                                dev.remove_layers(&media_layers);
+                                if let Some(id) = cover_layer {
                                     dev.remove_layer(id);
+                                    cover_layer = None;
                                 }
-                                notif_layer = Some(
-                                    dev.add_layer(ggoled_draw::DrawLayer::Image {
-                                        bitmap: (if connected {
-                                            &icon_hs_connect
-                                        } else {
-                                            &icon_hs_disconnect
-                                        })
-                                        .clone(),
-                                        x: 8,
-                                        y: 8,
-                                    }),
-                                );
-                                notif_expiry = Local::now() + NOTIF_DUR;
+
+                                let time = Local::now();
+                                if config.show_time {
+                                    let time_str = time.format("%H:%M:%S").to_string();
+                                    time_layers = dev.add_text_with_max_width(&time_str, None, Some(2), None);
+                                }
+
+                                if let Some(m) = &media {
+                                    media_layers = dev.add_text_with_max_width(
+                                        &format!("{}\n{}", m.title, m.artist),
+                                        None,
+                                        Some(8 + dev.font_line_height() as isize + 8),
+                                        None,
+                                    );
+                                }
+                                dev.play();
                             }
+
+                            if let Some(id) = notif_layer {
+                                dev.remove_layer(id);
+                            }
+                            notif_layer = Some(
+                                dev.add_layer(ggoled_draw::DrawLayer::Image {
+                                    bitmap: (if connected {
+                                        &icon_hs_connect
+                                    } else {
+                                        &icon_hs_disconnect
+                                    })
+                                    .clone(),
+                                    x: 8,
+                                    y: 8,
+                                }),
+                            );
+                            notif_expiry = Local::now() + NOTIF_DUR;
                         }
                     }
                     ggoled_draw::DrawEvent::DeviceEvent(ggoled_lib::DeviceEvent::Volume { .. }) => {}
@@ -409,11 +434,16 @@ fn oled_worker(rx: Receiver<WorkerMsg>, mut config: Config) {
         if time.second() != last_time.second() {
             last_time = time;
 
-            // Remove expired notifications
             if let Some(id) = notif_layer {
                 if time >= notif_expiry {
                     dev.remove_layer(id);
                     notif_layer = None;
+
+                    if temp_no_cover_mode {
+                        temp_no_cover_mode = false;
+                        last_media_info = String::new();
+                        last_config_state = String::new();
+                    }
                 }
             }
 
@@ -455,22 +485,13 @@ fn oled_worker(rx: Receiver<WorkerMsg>, mut config: Config) {
                         cover_layer = None;
                     }
 
-                    // Determine layout based on cover availability
-                    let should_show_cover = config.show_cover && config.show_media && media.is_some();
-                    let has_usable_cover = if let Some(m) = &media {
-                        m.cover.as_ref().is_some_and(|cover| !is_cover_useless(cover))
-                    } else {
-                        false
-                    };
-                    let display_cover = should_show_cover && has_usable_cover;
-
-                    // Remove notification if now displaying cover + media
-                    if display_cover && notif_layer.is_some() {
-                        if let Some(id) = notif_layer {
-                            dev.remove_layer(id);
-                            notif_layer = None;
-                        }
-                    }
+                    let display_cover = config.show_cover
+                        && config.show_media
+                        && media
+                            .as_ref()
+                            .and_then(|m| m.cover.as_ref())
+                            .is_some_and(|cover| !is_cover_useless(cover))
+                        && !temp_no_cover_mode;
 
                     if display_cover {
                         // Layout with cover: compact time and media on left, cover on right
@@ -565,7 +586,8 @@ fn oled_worker(rx: Receiver<WorkerMsg>, mut config: Config) {
                         && media
                             .as_ref()
                             .and_then(|m| m.cover.as_ref())
-                            .is_some_and(|cover| !is_cover_useless(cover));
+                            .is_some_and(|cover| !is_cover_useless(cover))
+                        && !temp_no_cover_mode;
 
                     if display_cover || (media.is_some() && config.show_media) {
                         // Compact time layout
